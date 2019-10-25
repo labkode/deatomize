@@ -1,0 +1,304 @@
+package main
+
+import (
+	"context"
+	"encoding/csv"
+	"flag"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cs3org/reva/pkg/eosclient"
+)
+
+// status tells if a record is a nasty one and the reason why
+type status uint32
+
+func (s status) String() string {
+	switch s {
+	case notNasty:
+		return "the_file_looks_good_and_could_be_repaired_because_we_might_a_valid_version"
+	case repairable:
+		return "the_file_can_be_automatically_repaired_because_we_have_found_a_valid_version"
+	case nastyNotChunk:
+		return "the_current-file_is_not_an_aborted_upload,_thus_we_do_not_know_if_it_is_a_good_file_or_not"
+	case nastyNoVersions:
+		return "there_are_no_versions_availabe_for_this_file"
+	case nastyInvalidVersion:
+		return "the_available_versions_are_invalid_because_they_are_chunked_uploads"
+	case nastyNotExistsAnymore:
+		return "the_current_file_does_not_exists_anymore"
+	default:
+		log.Fatal("invalid state")
+		return "invalid record state"
+	}
+}
+
+// reasons for being a nasty record
+const (
+	notNasty              = status(iota) // 0
+	repairable                           // 1
+	nastyNotChunk                        // 2
+	nastyNoVersions                      // 3
+	nastyInvalidVersion                  // 4
+	nastyNotExistsAnymore                // 5
+)
+
+var (
+	ctx    = context.Background()
+	mgm    = flag.String("mgm", "root://eoshome.cern.ch", "mgm url")
+	user   = flag.String("user", "root", "user rol to execute against MGM")
+	repair = flag.Bool("repair", false, "set to true to rollback a file from a valid version")
+	// the expected format of the file is
+	// 38371328          20191025       /eos/user/m/mdavis/CERNHome/.thunderbird/7njy9cjc.default/global-messages-db.sqlite
+	// where the separator is \t
+	file = flag.String("file", "./deatomize", "file containing files to deatomize")
+)
+
+func main() {
+	flag.Parse()
+
+	// get the records from the CSV tab-separated file.
+	records := getRecords(*file)
+
+	// get chunked records and nasty records
+	// chunked: the size is a multiple of a owncloud chunk of 10MB
+	// nasty: the size is NOT a multiple of a owncloud chunk of 10MB.
+	chunked, nasty := getRecordDistribution(records)
+
+	// Fix for chunked:
+	// the current file for the user is an aborted file which makes no sense.
+	// So we are going to try to get the list of versions if they are available for this file
+	// and take the latest one. If the latest has a size that is not a chunk, we revert back to it,
+	// else we continue taking older versions until finding one that suits us.
+	// If the are no versions of the available versions are not suited, the record moves to the nasty stack.
+	// This programm runs in dry mode by default printing the plan to take for each record.
+	count("Initial count for chunked records", chunked)
+	count("Initial count for nasty records", nasty)
+
+	chunked, nasty = analyze(chunked, nasty)
+
+	count("Automatic reparable records with valid version", chunked)
+	count("Nasty records, need manual repair with backup/recycle", nasty)
+	fmt.Println("Nasty record classification")
+	countNasty(nasty, nastyInvalidVersion)
+	countNasty(nasty, nastyNoVersions)
+	countNasty(nasty, nastyNotChunk)
+	countNasty(nasty, nastyNotExistsAnymore)
+
+	//rollback(chunked)
+
+}
+
+func countNasty(nasty []*record, s status) {
+	var c uint32
+	for _, r := range nasty {
+		if r != nil && r.Status == s {
+			c++
+		}
+	}
+	fmt.Printf("%s: %d\n", s.String(), c)
+}
+
+func rollback(chunked []*record) {
+	for i, r := range chunked {
+		fmt.Printf("dry-run=%t rollbacking records (%d/len(%d): %s\n", !*repair, i, len(chunked), r)
+	}
+}
+
+func describe(nasty []*record) {
+	for i, r := range nasty {
+		fmt.Printf("nasty record (%d/len(%d): %s\n", i, len(nasty), r)
+	}
+}
+
+func analyze(chunked, nasty []*record) ([]*record, []*record) {
+	var newchunked []*record
+	client := getEosClient()
+	// go over all chunked records and try and classify them
+	for i, r := range chunked {
+		fmt.Printf("analyzing chunked records (%d/len(%d): %s\n", i, len(chunked), r)
+		versions, err := client.ListVersions(ctx, *user, r.File)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		r.Versions = versions // add versions to the record
+		if len(r.Versions) == 0 {
+			r.Status = nastyNoVersions
+			nasty = append(nasty, r)
+		} else {
+			if valid := haveValidVersion(r); valid {
+				newchunked = append(newchunked, r)
+			} else {
+				r.Status = nastyInvalidVersion
+				nasty = append(nasty, r)
+			}
+		}
+	}
+	return newchunked, nasty
+}
+
+func haveValidVersion(r *record) bool {
+	sortVersions(r.Versions)
+	for _, v := range r.Versions {
+		if isChunked(v.Size) {
+			continue
+		}
+
+		// not chunked
+		// mark it as valid
+		r.Status = notNasty
+		r.ValidVersion = v
+		return true
+	}
+	return false
+}
+
+// sort versions from newest to oldest based on mtime reported from Eos.
+func sortVersions(versions []*eosclient.FileInfo) {
+	sort.Slice(versions, func(i, j int) bool {
+		return versions[i].MTimeSec > versions[j].MTimeSec
+	})
+}
+
+func getEosClient() *eosclient.Client {
+	// we need to connect to EOS
+	opts := &eosclient.Options{
+		URL: *mgm,
+	}
+
+	// create eos client
+	return eosclient.New(opts)
+}
+
+func count(msg string, records []*record) {
+	var c uint32
+	for _, r := range records {
+		if r != nil {
+			c++
+		}
+	}
+	fmt.Printf("%s: %d\n", msg, c)
+}
+
+func printRecords(records []*record) {
+	for _, r := range records {
+		fmt.Printf("%d %s %s\n", r.Size, r.Date, r.File)
+	}
+}
+
+func getRecords(file string) (records []*record) {
+	// read file
+	data, err := ioutil.ReadFile(file)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	r := csv.NewReader(strings.NewReader(string(data)))
+	r.Comma = '\t' // file is tab separeted
+	for {
+		each, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// validate that we get only three fields, else abort
+		if len(each) != 3 {
+			log.Fatal(fmt.Sprintf("error: record is invalid: %s", err))
+		}
+
+		r := &record{File: strings.TrimSpace(each[2])}
+		// parse size
+		u, err := strconv.ParseUint(strings.TrimSpace(each[0]), 10, 64)
+		if err != nil {
+			log.Fatal(fmt.Sprintf("error: record size is not an uint64: %s", err))
+		}
+		r.Size = u
+
+		// parse date
+		layout := "20060102"
+		t, err := time.Parse(layout, strings.TrimSpace(each[1]))
+		if err != nil {
+			log.Fatal(fmt.Sprintf("error: record size is not an uint64: %s", err))
+		}
+		r.Date = t
+
+		records = append(records, r)
+	}
+	return
+}
+
+func getRecordDistribution(records []*record) (chunked, nasty []*record) {
+	for i, r := range records {
+		if isChunked(r.Size) {
+			chunked = append(chunked, r)
+		} else {
+			r.Status = nastyNotChunk
+			nasty = append(nasty, r)
+		}
+		r.Handled = true
+		fmt.Printf("processing records (%d/len(%d): %s\n", i, len(chunked), r)
+	}
+	return
+}
+
+// chunks is ownCloud are 10MB
+func isChunked(size uint64) bool {
+	if size%(10*1000000) == 0 { // 10MB {}
+		return true
+	}
+	return false
+}
+
+// a record parses an input file like this one:
+// 38371328          20191025       /eos/user/m/mdavis/CERNHome/.thunderbird/7njy9cjc.default/global-messages-db.sqlite
+type record struct {
+	Handled      bool
+	Size         uint64
+	Date         time.Time
+	File         string
+	Status       status                // the status of the record, check top of the file for definition.
+	Versions     []*eosclient.FileInfo // available versions for this record if any.
+	ValidVersion *eosclient.FileInfo   // the version key of a valid version to rollback.
+}
+
+func (r *record) String() string {
+	var validVersion, status string
+	if r.ValidVersion != nil {
+		validVersion = r.ValidVersion.File
+	}
+	if r.Status == 0 {
+		status = "HEISENBERG"
+	} else if r.Status == 1 {
+		status = "GOOD"
+	} else {
+		status = "BAD"
+	}
+
+	if r.Handled {
+		return fmt.Sprintf("status=%s reason=%s size=%d date=%s versions=%d current_file=%s valid_version=%s",
+			status,
+			r.Status.String(),
+			r.Size,
+			r.Date,
+			len(r.Versions),
+			r.File,
+			validVersion,
+		)
+	}
+	return fmt.Sprintf("size=%d date=%s current_file=%s",
+		r.Size,
+		r.Date,
+		r.File,
+	)
+
+}
