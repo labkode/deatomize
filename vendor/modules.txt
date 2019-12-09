@@ -1,0 +1,21 @@
+# github.com/cs3org/reva v0.0.1
+github.com/cs3org/reva/pkg/appctx
+github.com/cs3org/reva/pkg/eosclient
+github.com/cs3org/reva/pkg/errtypes
+github.com/cs3org/reva/pkg/storage/acl
+# github.com/gofrs/uuid v3.2.0+incompatible
+github.com/gofrs/uuid
+# github.com/golang/groupcache v0.0.0-20190702054246-869f871628b6
+github.com/golang/groupcache/lru
+# github.com/pkg/errors v0.8.1
+github.com/pkg/errors
+# github.com/rs/zerolog v1.15.0
+github.com/rs/zerolog
+github.com/rs/zerolog/internal/cbor
+github.com/rs/zerolog/internal/json
+# go.opencensus.io v0.22.1
+go.opencensus.io
+go.opencensus.io/internal
+go.opencensus.io/trace
+go.opencensus.io/trace/internal
+go.opencensus.io/trace/tracestate

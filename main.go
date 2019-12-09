@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path"
 	"io/ioutil"
 	"log"
 	"sort"
@@ -83,6 +84,7 @@ func main() {
 
 	chunked, nasty = analyze(chunked, nasty)
 
+	/*
 	count("Automatic reparable records with valid version", chunked)
 	count("Nasty records, need manual repair with backup/recycle", nasty)
 	fmt.Println("Nasty record classification")
@@ -91,10 +93,32 @@ func main() {
 	countNasty(nasty, nastyNotChunk)
 	countNasty(nasty, nastyNotExistsAnymore)
 
+	*/
+	analyzeNasty(nasty)
+	printInvalid(nasty)
+
 	//rollback(chunked)
 
 }
 
+func analyzeNasty(nasty []*record) {
+	client := getEosClient()
+	for _, r := range nasty {
+		r.Handled = true
+		versions, err := client.ListVersions(ctx, *user, r.File)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		r.Versions = versions // add versions to the record
+	}
+}
+
+func printInvalid(nasty []*record) {
+	for _, r := range nasty {
+		fmt.Println(r)
+	}
+}
 func countNasty(nasty []*record, s status) {
 	var c uint32
 	for _, r := range nasty {
@@ -106,14 +130,14 @@ func countNasty(nasty []*record, s status) {
 }
 
 func rollback(chunked []*record) {
+	client := getEosClient()
 	for i, r := range chunked {
-		fmt.Printf("dry-run=%t rollbacking records (%d/len(%d): %s\n", !*repair, i, len(chunked), r)
-	}
-}
-
-func describe(nasty []*record) {
-	for i, r := range nasty {
-		fmt.Printf("nasty record (%d/len(%d): %s\n", i, len(nasty), r)
+		fmt.Printf("dry-run=%t rollback (%d/len(%d): file=%s version=%s\n", !*repair, i, len(chunked), r.File, path.Base(r.ValidVersion.File))
+		if *repair {
+			if err := client.RollbackToVersion(ctx, *user, r.File, path.Base(r.ValidVersion.File)); err != nil {
+				fmt.Printf("error rollbacking %s: %s\n", r, err)	
+			}
+		}
 	}
 }
 
