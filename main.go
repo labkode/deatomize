@@ -84,7 +84,6 @@ func main() {
 
 	chunked, nasty = analyze(chunked, nasty)
 
-	/*
 	count("Automatic reparable records with valid version", chunked)
 	count("Nasty records, need manual repair with backup/recycle", nasty)
 	fmt.Println("Nasty record classification")
@@ -93,11 +92,10 @@ func main() {
 	countNasty(nasty, nastyNotChunk)
 	countNasty(nasty, nastyNotExistsAnymore)
 
-	*/
 	analyzeNasty(nasty)
 	printInvalid(nasty)
 
-	//rollback(chunked)
+	rollback(chunked)
 
 }
 
