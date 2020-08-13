@@ -6,9 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"path"
 	"io/ioutil"
 	"log"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,23 +54,73 @@ var (
 	ctx    = context.Background()
 	mgm    = flag.String("mgm", "root://eoshome.cern.ch", "mgm url")
 	user   = flag.String("user", "root", "user rol to execute against MGM")
+	group  = flag.String("group", "root", "group rol to execute against MGM")
 	repair = flag.Bool("repair", false, "set to true to rollback a file from a valid version")
 	// the expected format of the file is
-	// 38371328          20191025       /eos/user/m/mdavis/CERNHome/.thunderbird/7njy9cjc.default/global-messages-db.sqlite
-	// where the separator is \t
+	// mtime fxid
+	// 1592324325 018edb0f
+	// 1592324325 018edb0f
+	// 1592324329 018edb40
+	// 1592324329 018edb40
+	// 1592324335 018edba3
+	// 1592324335 018edba3
+	// where the separator is whitespace
 	file = flag.String("file", "./deatomize", "file containing files to deatomize")
 )
+
+type skipped struct {
+	Recycle  int
+	Versions int
+	Atomic   int
+}
+
+func skipRecords(records []*record) (toret []*record, sk *skipped) {
+	sk = &skipped{}
+	client := getEosClient()
+	for _, r := range records {
+		fi, err := client.GetFileInfoByFXID(ctx, *user, *group, r.FXID)
+		if err != nil {
+			fmt.Printf("error getting md from EOS: %+v\n", err)
+			continue
+		}
+
+		// check that file is under a nominal space, not under proc recycle or versions folder
+		filename := fi.File
+		if strings.Contains(filename, "/proc/recycle") {
+			sk.Recycle++
+			fmt.Printf("skip: file is in recycle: %+v\n", fi)
+			continue
+
+		} else if strings.Contains(filename, "sys.v") {
+			sk.Versions++
+			fmt.Printf("skip: file is a version: %+v\n", fi)
+			continue
+
+		} else if strings.Contains(filename, "sys.a") {
+			sk.Atomic++
+			fmt.Printf("skip: file is atomic: %+v\n", fi)
+			continue
+		}
+
+		r.File = filename
+		toret = append(toret, r)
+	}
+	return toret, sk
+}
 
 func main() {
 	flag.Parse()
 
-	// get the records from the CSV tab-separated file.
+	// get the records from the CSV white-space separated file.
 	records := getRecords(*file)
+
+	// skip records that have been overwriten, are in trashbin or are versions.
+	newRecords, sk := skipRecords(records)
 
 	// get chunked records and nasty records
 	// chunked: the size is a multiple of a owncloud chunk of 10MB
 	// nasty: the size is NOT a multiple of a owncloud chunk of 10MB.
-	chunked, nasty := getRecordDistribution(records)
+	chunked, nasty := getRecordDistribution(newRecords)
 
 	// Fix for chunked:
 	// the current file for the user is an aborted file which makes no sense.
@@ -83,6 +133,9 @@ func main() {
 	count("Initial count for nasty records", nasty)
 
 	chunked, nasty = analyze(chunked, nasty)
+
+	fmt.Printf("total=%d to_analize=%d skip_recycle=%d skip_version=%d skip_atomic=%d\n",
+		len(records), len(newRecords), sk.Recycle, sk.Versions, sk.Atomic)
 
 	count("Automatic reparable records with valid version", chunked)
 	count("Nasty records, need manual repair with backup/recycle", nasty)
@@ -103,7 +156,7 @@ func analyzeNasty(nasty []*record) {
 	client := getEosClient()
 	for _, r := range nasty {
 		r.Handled = true
-		versions, err := client.ListVersions(ctx, *user, r.File)
+		versions, err := client.ListVersions(ctx, *user, *group, r.File)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -132,8 +185,8 @@ func rollback(chunked []*record) {
 	for i, r := range chunked {
 		fmt.Printf("dry-run=%t rollback (%d/len(%d): file=%s version=%s\n", !*repair, i, len(chunked), r.File, path.Base(r.ValidVersion.File))
 		if *repair {
-			if err := client.RollbackToVersion(ctx, *user, r.File, path.Base(r.ValidVersion.File)); err != nil {
-				fmt.Printf("error rollbacking %s: %s\n", r, err)	
+			if err := client.RollbackToVersion(ctx, *user, *group, r.File, path.Base(r.ValidVersion.File)); err != nil {
+				fmt.Printf("error rollbacking %s: %s\n", r, err)
 			}
 		}
 	}
@@ -145,7 +198,7 @@ func analyze(chunked, nasty []*record) ([]*record, []*record) {
 	// go over all chunked records and try and classify them
 	for i, r := range chunked {
 		fmt.Printf("analyzing chunked records (%d/len(%d): %s\n", i, len(chunked), r)
-		versions, err := client.ListVersions(ctx, *user, r.File)
+		versions, err := client.ListVersions(ctx, *user, *group, r.File)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -223,7 +276,7 @@ func getRecords(file string) (records []*record) {
 	}
 
 	r := csv.NewReader(strings.NewReader(string(data)))
-	r.Comma = '\t' // file is tab separeted
+	r.Comma = ' ' // file is space separated
 	for {
 		each, err := r.Read()
 		if err == io.EOF {
@@ -233,22 +286,20 @@ func getRecords(file string) (records []*record) {
 			log.Fatal(err)
 		}
 
-		// validate that we get only three fields, else abort
-		if len(each) != 3 {
+		// validate that we get only  two fields, else abort
+		if len(each) != 2 {
 			log.Fatal(fmt.Sprintf("error: record is invalid: %s", err))
 		}
 
-		r := &record{File: strings.TrimSpace(each[2])}
-		// parse size
-		u, err := strconv.ParseUint(strings.TrimSpace(each[0]), 10, 64)
-		if err != nil {
-			log.Fatal(fmt.Sprintf("error: record size is not an uint64: %s", err))
-		}
-		r.Size = u
+		r := &record{FXID: strings.TrimSpace(each[1])}
 
 		// parse date
-		layout := "20060102"
-		t, err := time.Parse(layout, strings.TrimSpace(each[1]))
+		i, err := strconv.ParseInt(each[0], 10, 64)
+		if err != nil {
+			log.Fatal(fmt.Sprintf("error: record is invalid: %s", err))
+		}
+
+		t := time.Unix(i, 0)
 		if err != nil {
 			log.Fatal(fmt.Sprintf("error: record size is not an uint64: %s", err))
 		}
@@ -284,6 +335,7 @@ func isChunked(size uint64) bool {
 // a record parses an input file like this one:
 // 38371328          20191025       /eos/user/m/mdavis/CERNHome/.thunderbird/7njy9cjc.default/global-messages-db.sqlite
 type record struct {
+	FXID         string
 	Handled      bool
 	Size         uint64
 	Date         time.Time
